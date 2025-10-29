@@ -11,6 +11,7 @@ use App\Shows;
 use App\BookedSeats;
 use App\Bookings;
 use App\Payments;
+use Stripe\Stripe;
 use Exception;
 
 
@@ -21,6 +22,188 @@ use Exception;
 class PaymentController extends Controller
 {
 
+    public function stripePayment(Request $request){
+
+        $selectedSeatsId = $request->selectedSeatsId;
+        if (is_string($selectedSeatsId)) {
+            $selectedSeatsId = json_decode($selectedSeatsId, true);
+        }
+
+        // Get customer data
+        if (auth()->check()) {
+            $customerId = auth()->user()->idmaster_user;
+            $customerEmail = auth()->user()->email;
+            $customerName = auth()->user()->first_name . ' ' . auth()->user()->last_name;
+        } else {
+            $customerId = null;
+            $customerEmail = null;
+            $customerName = null;
+        }
+
+        try {
+            // Validate that we have valid seats
+            if (!is_array($selectedSeatsId) || empty($selectedSeatsId)) {
+                throw new \Exception('Invalid seat selection data');
+            }
+
+            // Generate a unique booking ID
+            $showId = (int) $request->showId;
+            $firstSeatId = is_array($selectedSeatsId) 
+                ? (int) $selectedSeatsId[0] 
+                : (int) $selectedSeatsId;
+
+            $timeComponent = (int) substr(microtime(true) * 10000, -4);
+
+            $bookingId = (int) (
+                str_pad($showId, 2, '0', STR_PAD_LEFT) .
+                str_pad($firstSeatId, 3, '0', STR_PAD_LEFT) .
+                $timeComponent
+            );
+            
+            // Save booking data to database with PENDING status
+            $saveBooking = new Bookings();
+            $saveBooking->booking_id = $bookingId;
+            $saveBooking->shows_show_id = $showId;
+            $saveBooking->movies_movie_id = $request->movieId;
+            $saveBooking->master_user_idmaster_user = $customerId;
+            $saveBooking->amount = $request->totalAmount;
+            $saveBooking->payment_status = 'PENDING';
+            $saveBooking->save();
+
+            foreach ($selectedSeatsId as $seatId) {
+                $seatIdInt = (int) $seatId;
+                
+                // Skip invalid seat IDs
+                if ($seatIdInt <= 0) {
+                    \Log::warning('Skipping invalid seat ID: ' . $seatId);
+                    continue;
+                }
+                
+                $saveSeats = new BookedSeats();
+                $saveSeats->bookings_booking_id = $bookingId;
+                $saveSeats->seats_seat_id = $seatIdInt;
+                $saveSeats->save();
+            }
+
+            $bookingData = [
+                'amount' => $request->totalAmount,
+                'selectedSeatsId' => $selectedSeatsId,
+                'movieId' => $request->movieId,
+                'showId' => $request->showId,
+                'booking_id' => $bookingId,
+            ];
+            
+            session(['booking_data' => $bookingData]);
+
+            $stripe = new \Stripe\StripeClient(env('STRIPE_SECRET'));
+            $success_url = route('success').'?session_id={CHECKOUT_SESSION_ID}';
+
+            $selectedSeatsString = is_array($selectedSeatsId) 
+            ? implode(',', $selectedSeatsId) 
+            : $selectedSeatsId;
+
+        
+            $session = $stripe->checkout->sessions->create([
+                'success_url' => $success_url,
+                'line_items' => [
+                    [
+                        'price_data' => [
+                            'currency' => 'lkr',
+                            'product_data' => ['name' => 'Movie Ticket'],
+                            'unit_amount' => $request->totalAmount * 100, 
+                        ],
+                        'quantity' => 1,
+                    ],
+                ],
+                'mode' => 'payment',
+                'customer_creation' => 'always',
+                'metadata' => [
+                'selectedSeatsId' => $selectedSeatsString,
+                'movieId' => (string) $request->movieId,
+                'showId' => (string) $request->showId,
+                'amount' => (string) $request->totalAmount,
+                'booking_id' => (string) $bookingId,
+                ],
+            ]);
+            
+            return redirect($session->url);
+            
+        } catch (\Exception $e) {
+            \Log::error('Booking creation error: ' . $e->getMessage());
+            return redirect()->route('ticketpage')->with('error', 'Booking creation failed. Please try again.');
+        }
+    }
+
+
+
+    public function success(Request $request){
+        $stripe = new \Stripe\StripeClient(env('STRIPE_SECRET'));
+        $session = $stripe->checkout->sessions->retrieve($request->session_id);
+        
+        // Get booking data from session
+        $bookingData = session('booking_data');
+        
+        if (!$bookingData) {
+            return redirect()->route('ticketpage')->with('error', 'Booking data not found!');
+        }
+        
+        // Check if payment was successful
+        if ($session->payment_status == 'paid') {
+
+            if (auth()->check()) {
+                $customerId = auth()->user()->idmaster_user;
+                $customerEmail = auth()->user()->email;
+                $customerName = auth()->user()->first_name . ' ' . auth()->user()->last_name;
+            } else {
+                $customerId = null;
+                $customerEmail = $session->customer_details->email ?? null;
+                $customerName = $session->customer_details->name ?? null;
+            }
+
+            
+            try {
+                
+                $booking = Bookings::where('booking_id', $bookingData['booking_id'])->first();
+                if ($booking) {
+                    $booking->master_user_idmaster_user = $customerId;
+                    $booking->payment_status = 'PAID';
+                    $booking->customer_name = strtoupper($customerName);
+                    $booking->email = $customerEmail;
+                    $booking->save();
+
+                    $payment = new Payments();
+                    $payment->bookings_booking_id = $booking->booking_id;
+                    $payment->email = $customerEmail;
+                    $payment->amount = $booking->amount;
+                    $payment->save();
+                } else {
+                    throw new \Exception('Booking not found for update');
+                }
+                
+                // Store the booking data for the ticket page
+                $bookingData['payment_status'] = 'PAID';
+                $bookingData['stripe_session_id'] = $session->id;
+                $bookingData['customer_email'] = $customerEmail;
+                $bookingData['customer_name'] = $customerName;
+                
+                
+                session(['completed_booking' => $bookingData]);
+                session()->forget('booking_data');
+                
+                return redirect()->route('ticketpage')->with('success', 'Payment successful!');
+                
+            } catch (\Exception $e) {
+                \Log::error('Booking update error: ' . $e->getMessage());
+                return redirect()->route('ticketpage')->with('error', 'Payment successful but booking update failed. Please contact support.');
+            }
+            
+        } else {
+            // Payment failed - clean up the pending booking
+            $this->cleanupFailedBooking($bookingData['booking_id']);
+            session()->forget('booking_data');
+            return redirect()->route('ticketpage')->with('error', 'Payment failed. Please try again.');
+        }
+    }
 
     public function cancel(Request $request){
         // Get booking data from session
@@ -88,7 +271,7 @@ class PaymentController extends Controller
     }
     
 
-
+//Manual Payment *************************************************************************************************************************************
 
     public function paymentPage(){
 
